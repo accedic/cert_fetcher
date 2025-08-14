@@ -7,21 +7,24 @@
 # Install with:
 #   pip install httpx rich rich-argparse
 
-import httpx
+import importlib.util
 import re
 import logging
-from rich.logging import RichHandler
 import argparse
-from rich_argparse import RichHelpFormatter
 import traceback
 import os
-from rich.console import Console
 import sys
 import subprocess
+from urllib.parse import urlparse, parse_qs
+
+import httpx
+from rich.logging import RichHandler
+from rich_argparse import RichHelpFormatter
+from rich.console import Console
 
 
-class cert_fetcher:
-    """cert_fetcher is a client for automating login and SSL certificate retrieval
+class CertFetcher:
+    """CertFetcher is a client for automating login and SSL certificate retrieval
     from a web-based certificate management interface (such as HestiaCP).
     This class handles the full login flow, session management, and extraction of SSL certificate
     data for domains managed by the remote service. It supports writing the retrieved certificates,
@@ -73,24 +76,10 @@ class cert_fetcher:
             - Configures logging via setup_logging().
             - Initializes the HTTP client with set_http_client().
         """
-        self.ensure_requirements()
         self.args = args
         self.set_args()
         self.setup_logging()
         self.set_http_client()
-
-    def ensure_requirements():
-        import importlib.util
-
-        for pkg in ["httpx", "rich", "rich_argparse"]:
-            if importlib.util.find_spec(pkg.replace("-", "_")) is None:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-        required = ["httpx", "rich", "rich-argparse"]
-        for pkg in required:
-            try:
-                __import__(pkg.replace("-", "_"))
-            except ImportError:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
     def set_http_client(self):
         """
@@ -109,7 +98,7 @@ class cert_fetcher:
         """
 
         self.base_url = self.url.rstrip("/")
-        self.user_agent = "AceD's certificate client"
+        self.user_agent = "CertFetcher certificate client"
 
         self.token = None
         self.session_id = None
@@ -148,7 +137,7 @@ class cert_fetcher:
         and logs the name and value of each variable that does not start with an underscore.
         Private or protected variables (those starting with '_') are skipped.
         """
-
+        self.logger = logging.getLogger("CertFetcher")
         self.logger.debug("Namespace variables:")
         for k, v in vars(self).items():
             if k.startswith("_"):
@@ -177,18 +166,19 @@ class cert_fetcher:
             - Sets up logging with DEBUG level for all loggers, including 'httpx' and 'httpcore'.
             - Uses a rich handler for enhanced log output formatting.
             - Displays namespace variables for debugging purposes.
-            - Assigns a logger named 'cert_fetcher' to self.logger.
+            - Assigns a logger named 'CertFetcher' to self.logger.
         In non-debug mode:
             - Sets up logging with INFO level for the main script only.
             - Restricts 'httpx' and 'httpcore' loggers to WARNING level to reduce verbosity.
             - Uses a rich handler for log output formatting.
-            - Assigns a logger named 'cert_fetcher' to self.logger.
+            - Assigns a logger named 'CertFetcher' to self.logger.
         """
 
         if self.debug:
             # Enable full debug for everything, including httpx
             logging.basicConfig(
-                format="%(asctime)s %(levelname)s [%(name)s]: %(message)s",
+                format="[ %(name)s ]: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
                 level=logging.DEBUG,
                 handlers=[RichHandler()],
             )
@@ -196,18 +186,18 @@ class cert_fetcher:
             for logger_name in ["httpx", "httpcore"]:
                 logging.getLogger(logger_name).setLevel(logging.DEBUG)
             self._display_namespace_vars()
-            self.logger = logging.getLogger("cert_fetcher")
+            self.logger = logging.getLogger("CertFetcher")
         else:
             # Only log info from this script, do not touch httpx loggers
             logging.basicConfig(
-                format="%(message)s",
+                format="[ %(name)s ]: %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
                 level=logging.INFO,
                 handlers=[RichHandler()],
             )
             for logger_name in ["httpx", "httpcore"]:
                 logging.getLogger(logger_name).setLevel(logging.WARNING)
-            self.logger = logging.getLogger("cert_fetcher")
+            self.logger = logging.getLogger("CertFetcher")
 
     def _update_cookies_and_headers(self, response):
         """
@@ -221,14 +211,16 @@ class cert_fetcher:
             response: The HTTP response object containing cookies and URL information.
         """
 
-        # Update cookies (especially HESTIASID)
-        for k, v in response.cookies.items():
-            self.cookies.set(k, v)
-            if k == "HESTIASID":
-                self.session_id = v
-        # Update referer for next request
-        self.headers["referer"] = str(response.url)
-        self.client.headers = self.headers
+        for k, v in response.headers.items():
+            if k == "Set-Cookie" or k == "Cookie" and k == "HESTIASID":
+
+                self.logger.debug(f"Setting cookie from header: {v}")
+
+                self.cookies.set_cookie(v)
+        for x in self.client.cookies.items():
+            self.logger.debug(f"Client Cookie {x[0]}: {x[1]}")
+        for x in self.client.headers.items():
+            self.logger.debug(f"Client Header {x[0]}: {x[1]}")
 
     def _extract_token(self, html):
         """
@@ -247,10 +239,12 @@ class cert_fetcher:
         )
         if match:
             self.token = match.group(1)
+            self.logger.debug(self.token)
             return self.token
         return None
 
     def get_login_page(self):
+        self.logger.debug("Fetching login page...")
         """
         Sends a GET request to the login page, updates cookies and headers, extracts the authentication token, and returns the response.
         Returns:
@@ -258,6 +252,15 @@ class cert_fetcher:
         """
 
         resp = self.client.get("/login/")
+        for x in self.client.__dict__.items():
+            self.logger.debug(
+                f"{self.get_login_page.__name__} Client attribute {x[0]}: {x[1]}"
+            )
+        self.logger.debug(
+            f"Fetching {self.post_username.__name__}: {self.base_url}/login/\n"
+            f"Response status code: {resp.status_code}"
+        )
+
         self._update_cookies_and_headers(resp)
         self._extract_token(resp.text)
         return resp
@@ -271,11 +274,20 @@ class cert_fetcher:
         Returns:
             Response: The response object returned by the POST request.
         """
-
+        self.logger.debug("sending username...")
         data = {"token": self.token, "user": self.username}
         resp = self.client.post("/login/", data=data, cookies=self.cookies)
+        for x in self.client.__dict__.items():
+            self.logger.debug(
+                f"{self.post_username.__name__} Client attribute {x[0]}: {x[1]}"
+            )
+        self.logger.debug(
+            f"Fetching {self.post_username.__name__}: {self.base_url}/list/web/\n"
+            f"Response status code: {resp.status_code}"
+        )
         self._update_cookies_and_headers(resp)
         self._extract_token(resp.text)
+
         return resp
 
     def post_password(self):
@@ -287,32 +299,42 @@ class cert_fetcher:
         Returns:
             Response: The response object returned by the POST request.
         """
-
+        self.logger.debug("sending password...")
         data = {"token": self.token, "password": self.password}
         resp = self.client.post("/login/", data=data, cookies=self.cookies)
-        self._update_cookies_and_headers(resp)
-        # Optionally extract token again if needed
-        return resp
+        if resp.status_code != 200 or "login" in str(resp.url).lower():
+            self.logger.error("Login failed. Check your credentials.")
+            self.logger.debug(resp.status_code)
+            self.logger.debug(resp.url)
+            raise Exception("Login failed")
 
-    def get_front_page(self):
-        """
-        Retrieves the front page of the web interface, extracts and returns a list of unique domain edit URLs.
-        Sends a GET request to the "/list/web/" endpoint using the current session cookies, updates cookies and headers,
-        parses the response HTML to find all unique edit URLs for domains, logs the found URLs, extracts a security token,
-        and updates the referer header for subsequent requests.
-        Returns:
-            list: A list of unique domain edit URL identifiers extracted from the front page.
-        """
-
-        resp = self.client.get("/list/web/", cookies=self.cookies)
-        self._update_cookies_and_headers(resp)
-        # Parse resp.text for href="/edit/web/" and save the logins
+        self.logger.info("Login successful.")
+        for x in self.client.__dict__.items():
+            self.logger.debug(
+                f"{self.post_password.__name__} Client attribute {x[0]}: {x[1]}"
+            )
+        self.logger.debug(
+            f"Fetching post_pwd: {self.base_url}/list/web/\n"
+            f"Response status code: {resp.status_code}"
+        )
         domain_edit_urls = re.findall(r'href="/edit/web/([^"]+)"', resp.text)
         domain_edit_urls = list(set(domain_edit_urls))  # Remove duplicates
-        logging.debug(domain_edit_urls)
+        uri_data = []
+        for x in domain_edit_urls:
+            parsed_uri = urlparse(self.base_url + x)
+            domain = parse_qs(parsed_uri.query)["domain"][0]
+            token = parse_qs(parsed_uri.query)["token"][0]
+            d = {
+                "uri": x,
+                "domain": domain,
+                "token": token,
+            }
+            uri_data.append(d)
+            self.logger.debug(f"Extracted domain: {d['domain']}, token: {d['token']}")
         self._extract_token(resp.text)
-        self.client.headers["referer"] = f"{self.base_url}/list/web/"
-        return domain_edit_urls
+        self._update_cookies_and_headers(resp)
+        prep_return = {"response": resp, "uri_data": uri_data}
+        return prep_return
 
     def fetch_domain_certificate_page(self, domain_edit_url, domain_name):
         """
@@ -328,13 +350,23 @@ class cert_fetcher:
         Logs:
             Debug information about the fetching process.
         """
-
-        logging.debug(f"Fetching SSL certificate for domain: {domain_edit_url}")
-        # domain_name = domain_edit_url.split('&')[0].split(
-        #    '=')[1]  # Extract domain name from URL
         # self.logger.info(f"Fetching SSL certificate for domain: {domain_name}")
-        resp = self.client.get(f"/edit/web/{domain_edit_url}", cookies=self.cookies)
+        self.logger.debug(f"Domain edit URL: {domain_edit_url}")
+        self.logger.debug(f"Fetching SSL certificate for domain: {domain_edit_url}")
+        resp = self.client.get(
+            f"/edit/web/{domain_edit_url}",
+            cookies=self.cookies,
+        )
+
+        for x in self.client.__dict__.items():
+            self.logger.debug(
+                f"{self.fetch_domain_certificate_page.__name__} Client attribute {x[0]}: {x[1]}"
+            )
+
         cert_data = self.parse_certificate_page(resp.text, domain_name)
+        self.logger.debug(cert_data)
+        self._extract_token(resp.text)
+        self._update_cookies_and_headers(resp)
         return cert_data
 
     def parse_certificate_page(self, html, domain_name):
@@ -438,36 +470,44 @@ class cert_fetcher:
 
         # Step 1: GET /login/
         login_resp = self.get_login_page()
+
         # Step 2: POST username
         user_resp = self.post_username()
-        # Step 3: POST password
-        pass_resp = self.post_password()
-        if pass_resp.status_code != 200 or "login" in str(pass_resp.url).lower():
-            logging.error("Login failed. Check your credentials.")
-            raise Exception("Login failed")
-        else:
-            self.logger.info("Login successful.")
 
-        list_of_domain_path = self.get_front_page()
+        # Step 3: POST password
+        resp_pass = self.post_password()
+        uri_data = resp_pass.get("uri_data", [])
+        resp_pass = resp_pass.get("response", None)
+        list_of_domain_path = [x.get("uri", []) for x in uri_data]
         self.logger.info(f"Found {len(list_of_domain_path)} domains.")
+        for x in uri_data:
+            self.logger.info(f"Domain: {x['domain']}")
 
         all_certificate_data = []
 
         for x in list_of_domain_path:
             domain_name = self.set_domain_name(x)
             cert_data = self.fetch_domain_certificate_page(x, domain_name)
+            self.logger.debug(cert_data)
             all_certificate_data.append(cert_data)
 
         # self.loop_over_domain_urls(list_of_domain_path)
-        logging.debug(
-            {
-                "login_page": login_resp,
-                "username_post": user_resp,
-                "password_post": pass_resp,
-                "HESTIASID": self.session_id,
-                "token": self.token,
-            }
-        )
+        debug_dict = {
+            "login_page": login_resp,
+            "username_post": user_resp,
+            "password_post": resp_pass,
+            "uri_data": uri_data,
+            "HESTIASID": self.session_id,
+            "token": self.token,
+        }
+        for k, v in debug_dict.items():
+            if k == "uri_data":
+                for x in v:
+                    for k, v in x.items():
+                        self.logger.debug(f"{k}: {v}")
+            else:
+                self.logger.debug(f"{k}: {v}")
+
         return all_certificate_data
 
     def run(self):
@@ -484,7 +524,7 @@ class cert_fetcher:
             - If `self.write_to_file` is True, writes the certificate to a file and appends the result to the response list.
             - Handles and logs HTTP and general exceptions.
         """
-
+        self.logger.debug(self.write_to_file)
         try:
             result = self.full_login_flow()
             final_response = []
@@ -536,10 +576,7 @@ class cert_fetcher:
         """
 
         result = {"domain": domain_data["domain"]}
-        # if self.output_dir == ".":
-        self.logger.info("Writing certificates to current directory.")
-
-        self.logger.info(f"Writing certificates to {self.output_dir}")
+        # self.logger.info(f"Writing certificates to {self.output_dir}")
         domain = domain_data["domain"]
         ssl_crt_value = domain_data.get("ssl_crt_value")
         ssl_key_value = domain_data.get("ssl_key_value")
@@ -548,33 +585,35 @@ class cert_fetcher:
             os.makedirs(self.output_dir, exist_ok=True)
 
         if ssl_crt_value:
-            cert_file_path = f"{self.output_dir}/{domain}.crt"
-            with open(cert_file_path, "w") as cert_file:
-                cert_file.write(ssl_crt_value)
-            logging.debug(f"Wrote certificate to {cert_file_path}")
-            result["ssl_crt_value"] = cert_file_path
-            self.logger.info(f"Wrote crt to {cert_file_path}")
-            if self.write_certificate_to_file is False:
+            if self.write_to_file is True:
+                cert_file_path = f"{self.output_dir}/{domain}.crt"
+                with open(cert_file_path, "w") as cert_file:
+                    cert_file.write(ssl_crt_value)
+                logging.debug(f"Wrote certificate to {cert_file_path}")
+                result["ssl_crt_value"] = cert_file_path
+                self.logger.info(f"Wrote crt to {cert_file_path}")
+            if self.write_to_file is False:
                 self.logger.info(ssl_crt_value)
 
         if ssl_key_value:
-            key_file_path = f"{self.output_dir}/{domain}.key"
-            with open(key_file_path, "w") as key_file:
-                key_file.write(ssl_key_value)
-            logging.debug(f"Wrote key to {key_file_path}")
-            result["ssl_key_value"] = key_file_path
-            self.logger.info(f"Wrote key to {key_file_path}")
-            if self.write_certificate_to_file is False:
+            if self.write_to_file is True:
+                key_file_path = f"{self.output_dir}/{domain}.key"
+                with open(key_file_path, "w") as key_file:
+                    key_file.write(ssl_key_value)
+                logging.debug(f"Wrote key to {key_file_path}")
+                result["ssl_key_value"] = key_file_path
+                self.logger.info(f"Wrote key to {key_file_path}")
+            if self.write_to_file is False:
                 self.logger.info(ssl_key_value)
-
-        if ssl_ca_value:
-            ca_file_path = f"{self.output_dir}/{domain}.ca"
-            with open(ca_file_path, "w") as ca_file:
-                ca_file.write(ssl_ca_value)
-            logging.debug(f"Wrote CA to {ca_file_path}")
-            result["ssl_ca_value"] = ca_file_path
-            self.logger.info(f"Wrote ca to {ca_file_path}")
-            if self.write_certificate_to_file is False:
+        if self.write_to_file is True:
+            if ssl_ca_value:
+                ca_file_path = f"{self.output_dir}/{domain}.ca"
+                with open(ca_file_path, "w") as ca_file:
+                    ca_file.write(ssl_ca_value)
+                logging.debug(f"Wrote CA to {ca_file_path}")
+                result["ssl_ca_value"] = ca_file_path
+                self.logger.info(f"Wrote ca to {ca_file_path}")
+            if self.write_to_file is False:
                 self.logger.info(ssl_ca_value)
 
         if not ssl_crt_value and not ssl_key_value and not ssl_ca_value:
@@ -596,14 +635,15 @@ class cert_fetcher:
             return result
 
         # Write fullchain file if both crt and ca are present
-        if ssl_crt_value and ssl_ca_value:
-            fullchain_file_path = f"{self.output_dir}/fullchain_{domain}.pem"
-            with open(fullchain_file_path, "w") as fullchain_file:
-                fullchain_file.write(ssl_crt_value + "\n" + ssl_ca_value)
-            logging.debug(f"Wrote fullchain to {fullchain_file_path}")
-            result["ssl_fullchain_value"] = fullchain_file_path
-            self.logger.info(f"Wrote fullchain to {fullchain_file_path}")
-            if self.write_certificate_to_file is False:
+        if self.write_to_file is True:
+            if ssl_crt_value and ssl_ca_value:
+                fullchain_file_path = f"{self.output_dir}/fullchain_{domain}.pem"
+                with open(fullchain_file_path, "w") as fullchain_file:
+                    fullchain_file.write(ssl_crt_value + "\n" + ssl_ca_value)
+                logging.debug(f"Wrote fullchain to {fullchain_file_path}")
+                result["ssl_fullchain_value"] = fullchain_file_path
+                self.logger.info(f"Wrote fullchain to {fullchain_file_path}")
+            if self.write_to_file is False:
                 self.logger.info(ssl_crt_value + "\n" + ssl_ca_value)
         return result
 
@@ -633,9 +673,9 @@ if __name__ == "__main__":
         justify="center",
     )
     parser = argparse.ArgumentParser(
-        description="cert_fetcher",
+        description="CertFetcher: Automate SSL Certificate Retrieval",
         formatter_class=RichHelpFormatter,
-        epilog="This script automates the login and SSL certificate retrieval process for cert_fetcher for Hestia Control Panel.",
+        epilog="This script automates the login and SSL certificate retrieval process for Hestia Control Panel.",
         add_help=True,
     )
     parser.add_argument(
@@ -702,4 +742,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    cert_fetcher(args).run()
+    CertFetcher(args).run()

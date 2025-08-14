@@ -1,0 +1,5 @@
+httpcore==1.0.5
+httptools==0.6.1
+httpx==0.27.0
+rich==13.7.1
+rich-argparse==1.7.1
